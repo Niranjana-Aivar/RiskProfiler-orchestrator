@@ -9,6 +9,7 @@ from models import (
 )
 from database import db_manager
 from config import settings
+from database_config import get_database_type, is_postgresql_table, is_dynamodb_table
 
 logger = logging.getLogger(__name__)
 debug_logger = logging.getLogger("attackpath.debug")
@@ -25,71 +26,173 @@ class AttackPathEngine:
         self.path_templates: List[AttackPath] = []
         self.table_columns_canonical: Dict[str, List[str]] = {}
         
-    async def load_attack_path_templates(self, templates_file: str = "attack_paths_rules_enhanced.json"):
-        """Load attack path templates from JSON file"""
+    async def load_attack_path_templates(self, templates_file: str = "attack_paths_rules_enhanced_updated.json"):
+        """Load attack path templates from JSON file (for local development)"""
         try:
             logger.info(f"Loading attack path templates from {templates_file}")
             with open(templates_file, 'r') as f:
                 data = json.load(f)
-                
-            # Parse the templates
-            for path_data in data.get('paths', []):
-                # Filter out supporting_findings nodes from all templates
-                filtered_nodes = []
-                for node in path_data.get('nodes', []):
-                    if node.get('node_type') != 'supporting_findings':
-                        filtered_nodes.append(node)
-                    else:
-                        logger.debug(f"Filtered out supporting_findings node from template {path_data.get('id')}")
-                
-                # Update the path data with filtered nodes
-                path_data['nodes'] = filtered_nodes
-                
-                path = AttackPath(**path_data)
-                self.path_templates.append(path)
             
-            self.table_columns_canonical = data.get('table_columns_canonical', {})
-            logger.info(f"Loaded {len(self.path_templates)} attack path templates (supporting_findings nodes filtered out)")
+            await self._parse_templates_data(data)
             
         except Exception as e:
             logger.error(f"Error loading attack path templates: {e}")
             raise
     
-    async def instantiate_attack_paths(self, organization_id: str, scan_id: str, cache: Dict[str, Any] = None) -> List[AttackPathInstance]:
+    async def load_attack_path_templates_from_data(self, templates_data: Dict[str, Any]):
+        """Load attack path templates from S3 data (for AWS Batch)"""
+        try:
+            logger.info("Loading attack path templates from S3 data")
+            await self._parse_templates_data(templates_data)
+            
+        except Exception as e:
+            logger.error(f"Error loading attack path templates from S3 data: {e}")
+            raise
+    
+    async def _parse_templates_data(self, data: Dict[str, Any]):
+        """Parse templates data from either local file or S3"""
+        # Clear existing templates
+        self.path_templates = []
+        
+        # Parse the templates
+        for path_data in data.get('paths', []):
+            # Filter out supporting_findings nodes from all templates
+            filtered_nodes = []
+            for node in path_data.get('nodes', []):
+                if node.get('node_type') != 'supporting_findings':
+                    filtered_nodes.append(node)
+                else:
+                    logger.debug(f"Filtered out supporting_findings node from template {path_data.get('id')}")
+
+            # Update the path data with filtered nodes
+            path_data['nodes'] = filtered_nodes
+            
+            path = AttackPath(**path_data)
+            self.path_templates.append(path)
+        
+        self.table_columns_canonical = data.get('table_columns_canonical', {})
+        logger.info(f"Loaded {len(self.path_templates)} attack path templates (supporting_findings nodes filtered out)")
+    
+    async def instantiate_attack_paths(self, organization_id: str, scan_id: str) -> List[AttackPathInstance]:
         """Instantiate all possible attack paths for an organization"""
         logger.info(f"Instantiating attack paths: loaded template count = {len(self.path_templates)}")
         instances = []
+        successful_templates = 0
+        failed_templates = 0
         
         for path_template in self.path_templates:
             try:
                 # Try to instantiate this path
                 path_instances = await self._instantiate_single_path(
-                    path_template, organization_id, scan_id, cache
+                    path_template, organization_id, scan_id
                 )
-                instances.extend(path_instances)
+                if path_instances:
+                    instances.extend(path_instances)
+                    successful_templates += 1
+                    logger.debug(f"Successfully instantiated template {path_template.id}: {len(path_instances)} instances")
+                else:
+                    logger.debug(f"Template {path_template.id} generated 0 instances (no data or failed validation)")
                 
             except Exception as e:
+                failed_templates += 1
                 logger.warning(f"Error instantiating path {path_template.id}: {e}")
                 continue
         
+        logger.info(f"Template processing summary: {successful_templates} successful, {failed_templates} failed, {len(self.path_templates) - successful_templates - failed_templates} with no data")
         logger.info(f"Generated {len(instances)} attack path instances")
         return instances
+
+    async def generate_attack_paths_json(self, db_manager, organization_id: str, scan_id: str) -> List[Dict[str, Any]]:
+        """Generate attack paths and return JSON-ready format with nodes field"""
+        logger.info(f"Generating attack paths JSON: loaded template count = {len(self.path_templates)}")
+        
+        # Get the raw instances
+        # Store db_manager for use in methods
+        self.db_manager = db_manager
+        instances = await self.instantiate_attack_paths(organization_id, scan_id)
+        
+        # Convert to JSON format
+        json_output = []
+        skipped_count = 0
+        
+        for path_instance in instances:
+            # Check if this instance has any findings
+            has_findings = False
+            total_findings = 0
+            
+            if hasattr(path_instance, 'nodes_data') and path_instance.nodes_data:
+                if 'possible_paths' in path_instance.nodes_data:
+                    total_findings = len(path_instance.nodes_data['possible_paths'])
+                    has_findings = total_findings > 0
+                elif 'total_possible_paths' in path_instance.nodes_data:
+                    total_findings = path_instance.nodes_data['total_possible_paths']
+                    has_findings = total_findings > 0
+            
+            # Only include instances with findings
+            if has_findings:
+                # Find the corresponding path template to get node names
+                path_template = None
+                for template in self.path_templates:
+                    if template.id == path_instance.path_id:
+                        path_template = template
+                        break
+                
+                # Extract node names from the path template
+                node_names = []
+                if path_template:
+                    node_names = [node.node_type for node in path_template.nodes]
+                else:
+                    logger.warning(f"Could not find template for path_id: {path_instance.path_id}")
+                
+                path_json = {
+                    "path_id": path_instance.path_id,
+                    "name": path_instance.path_name,
+                    "description": path_instance.path_description,
+                    "goals": path_instance.goals,
+                    "outcomes": path_instance.outcomes,
+                    "nodes": node_names,  # NEW FIELD: List of node names
+                    "possible_paths": [],
+                    "total_possible_paths": total_findings
+                }
+                
+                # Add possible paths if available
+                if hasattr(path_instance, 'nodes_data') and path_instance.nodes_data:
+                    if 'possible_paths' in path_instance.nodes_data:
+                        path_json["possible_paths"] = path_instance.nodes_data['possible_paths']
+                        path_json["total_possible_paths"] = len(path_instance.nodes_data['possible_paths'])
+                    elif 'total_possible_paths' in path_instance.nodes_data:
+                        path_json["total_possible_paths"] = path_instance.nodes_data['total_possible_paths']
+                
+                json_output.append(path_json)
+            else:
+                skipped_count += 1
+                logger.debug(f"Skipping {path_instance.path_id} - no findings ({total_findings} paths)")
+        
+        logger.info(f"JSON generation summary: {len(json_output)} instances with findings, {skipped_count} skipped")
+        return json_output
     
-    async def _instantiate_single_path(self, path_template: AttackPath, organization_id: str, scan_id: str, cache: Dict[str, Any] = None) -> List[AttackPathInstance]:
-        """Instantiate a single attack path template"""
+    async def _instantiate_single_path(self, path_template: AttackPath, organization_id: str, scan_id: str) -> List[AttackPathInstance]:
+        """Instantiate a single attack path template using dynamic query processing"""
         instances = []
         
         try:
-            # Get all required data for this path
-            path_data = await self._gather_path_data(path_template, organization_id, scan_id, cache)
+            # Guard against Cartesian products: skip multi-node templates with no joins
+            if self._should_skip_due_to_no_joins(path_template):
+                return []
+            
+            # Use dynamic sequential processing
+            debug_logger.info("🚀 Using NEW dynamic sequential processing for template: %s", path_template.id)
+            path_data = await self._process_nodes_sequentially(path_template, organization_id, scan_id)
             
             if not path_data:
+                logger.warning(f"No data found for path template {path_template.id}")
                 return []
             
             # Check if all required nodes are present
             required_nodes_present = self._check_required_nodes_present(path_template, path_data)
             
             if not required_nodes_present:
+                logger.warning(f"Required nodes not present for path template {path_template.id}")
                 return []
             
             # Create the new joined data structure
@@ -111,9 +214,362 @@ class AttackPathEngine:
             instances.append(instance)
             
         except Exception as e:
-            logger.error(f"Error instantiating path {path_template.id}: {e}")
+            logger.warning(f"Template {path_template.id} has invalid selector/join: {e}. Skipping template.")
+            debug_logger.error("Error processing template %s: %s", path_template.id, e)
         
         return instances
+
+    def _should_skip_due_to_no_joins(self, path_template: AttackPath) -> bool:
+        """Return True if a multi-node template lacks joins, which would create a Cartesian product."""
+        try:
+            ordered_nodes = sorted(path_template.nodes, key=lambda n: n.order)
+            # Single-node templates are always safe
+            if len(ordered_nodes) <= 1:
+                return False
+            
+            # If none of the nodes define any join, skip to prevent Cartesian product
+            any_joins_defined = any(getattr(node, 'join', None) for node in ordered_nodes)
+            if not any_joins_defined:
+                logger.warning(
+                    "Skipping template %s: multi-node template without joins would create a Cartesian product",
+                    path_template.id,
+                )
+                return True
+            
+            # Additionally, if any required non-first node has no join, skip as it can explode combinations
+            for idx, node in enumerate(ordered_nodes[1:], start=1):
+                if not node.optional and (not getattr(node, 'join', None)):
+                    logger.warning(
+                        "Skipping template %s: required node '%s' has no join; would create a Cartesian product",
+                        path_template.id,
+                        node.node_type,
+                    )
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(
+                "Validation error while checking joins for template %s: %s. Proceeding cautiously.",
+                getattr(path_template, 'id', 'unknown'),
+                e,
+            )
+            return False
+    
+    async def _process_nodes_sequentially(self, path_template: AttackPath, organization_id: str, scan_id: str) -> Dict[str, Any]:
+        """Process nodes in order, passing results as WHERE conditions to next node"""
+        debug_logger.debug("Processing nodes sequentially for template: %s", path_template.id)
+        
+        # Get nodes in order
+        ordered_nodes = sorted(path_template.nodes, key=lambda n: n.order)
+        debug_logger.debug("Ordered nodes: %r", [n.node_type for n in ordered_nodes])
+        
+        current_results = None
+        node_data = {}
+        
+        for i, node in enumerate(ordered_nodes):
+            debug_logger.debug("Processing node %d: %s (table: %s)", i, node.node_type, node.table)
+            
+            # Determine database type
+            db_type = get_database_type(node.table)
+            debug_logger.debug("Database type for %s: %s", node.table, db_type)
+            
+            # Build WHERE conditions from previous node results
+            where_conditions = self._build_where_conditions(current_results, node, path_template)
+            debug_logger.debug("WHERE conditions for %s: %r", node.node_type, where_conditions)
+            
+            # Query current node with conditions
+            node_results = await self._query_node_dynamic(
+                node, organization_id, scan_id, where_conditions, db_type
+            )
+            
+            debug_logger.info("Node %s: fetched %d records", node.node_type, len(node_results) if node_results else 0)
+            
+            # Store results
+            node_data[node.node_type] = node_results
+            current_results = node_results  # Pass to next node
+            
+            # If no results and node is required, stop processing
+            if not node_results and not node.optional:
+                debug_logger.warning("Required node %s has no data, stopping processing", node.node_type)
+                break
+        
+        return node_data
+    
+    def _build_where_conditions(self, previous_results: List[Dict[str, Any]], current_node: AttackPathNode, path_template: AttackPath) -> Dict[str, List[Any]]:
+        """Build WHERE conditions for current node based on previous results and join rules"""
+        where_conditions = {}
+        
+        # First, convert node selectors to WHERE conditions (for first node or nodes without joins)
+        if current_node.selector:
+            for field, selector_def in current_node.selector.items():
+                if selector_def.get("op") == "=":
+                    # Convert single value to list for consistency with IN operations
+                    where_conditions[field] = [selector_def["value"]]
+                elif selector_def.get("op") == "in":
+                    where_conditions[field] = selector_def["value"]
+                else:
+                    debug_logger.warning("Unsupported selector operation: %s for field %s", selector_def.get("op"), field)
+        
+        # If no previous results or no joins, return selector-based conditions
+        if not previous_results or not current_node.join:
+            return where_conditions
+        
+        # Find the join rule for this node
+        for join_def in current_node.join:
+            from_table = join_def["from"].split(".", 1)[0]
+            from_field = join_def["from"].split(".", 1)[1]
+            to_field = join_def["to"].split(".", 1)[1]
+            
+            debug_logger.debug("Join rule: %s.%s -> %s.%s", from_table, from_field, current_node.table, to_field)
+            
+            # Extract values from previous results
+            values = []
+            for result in previous_results:
+                value = result.get(from_field)
+                if value is not None:
+                    values.append(value)
+            
+            if values:
+                # Deduplicate values to reduce DynamoDB FilterExpression size
+                unique_values = list(set(values))
+                where_conditions[to_field] = unique_values
+                
+                # Log the deduplication for debugging
+                if len(values) != len(unique_values):
+                    debug_logger.debug("Deduplicated %s: %d -> %d values", to_field, len(values), len(unique_values))
+                else:
+                    debug_logger.debug("Built WHERE condition: %s IN (%d values)", to_field, len(values))
+        
+        return where_conditions
+    
+    def _find_matching_item_for_combination(self, previous_item: Dict[str, Any], node_data: List[Dict[str, Any]], node: AttackPathNode, path_template: AttackPath) -> Optional[Dict[str, Any]]:
+        """Find the matching item from node_data that relates to previous_item based on join relationships"""
+        if not node.join or not previous_item:
+            # If no join or no previous item, return the first item
+            return node_data[0] if node_data else None
+        
+        # Find the join rule for this node
+        for join_def in node.join:
+            from_table = join_def["from"].split(".", 1)[0]
+            from_field = join_def["from"].split(".", 1)[1]
+            to_table = join_def["to"].split(".", 1)[0]
+            to_field = join_def["to"].split(".", 1)[1]
+            
+            # Debug logging
+            debug_logger.debug("Join rule: %s.%s = %s.%s", from_table, from_field, to_table, to_field)
+            debug_logger.debug("Previous item keys: %s", list(previous_item.keys()))
+            debug_logger.debug("Node data sample keys: %s", list(node_data[0].keys()) if node_data else "No data")
+            
+            # The join rule is: from_table.from_field = to_table.to_field
+            # previous_item is from the previous node (to_table)
+            # We need to get the value from previous_item that corresponds to the field in to_table
+            # and then find the item in node_data (from_table) that has from_field with that value
+            
+            # The join rule is: from_table.from_field = to_table.to_field
+            # previous_item is from to_table, so we need to get the field that corresponds to to_table
+            # But the field name in previous_item might be different from to_field
+            
+            # For DNS -> IP: OrganizationDNS.value = OrganizationIPRanges.ip_range
+            # previous_item is from OrganizationDNS, so we need to get "value" from it
+            # and find an item in node_data (OrganizationIPRanges) where "ip_range" matches that value
+            
+            # For IP -> CVE: OrganizationIPRanges.ip_range = OrganizationCVEsV2.asset  
+            # previous_item is from OrganizationIPRanges, so we need to get "ip_range" from it
+            # and find an item in node_data (OrganizationCVEsV2) where "asset" matches that value
+            
+            # The key insight: we need to get the field from previous_item that corresponds to the join
+            # This is the field name in the previous table that should match the current table's field
+            
+            # Get the value from previous_item using the field that should match
+            # This is the field from the previous table that should match the current table's field
+            previous_value = previous_item.get(from_field)
+            if previous_value is None:
+                debug_logger.debug("No value found for field %s in previous item", from_field)
+                continue
+            
+            debug_logger.debug("Looking for matches with value: %s", previous_value)
+            
+            # Find matching item in node_data where to_field matches previous_value
+            for item in node_data:
+                item_value = item.get(to_field)
+                if item_value == previous_value:
+                    debug_logger.debug("Found match: %s = %s", item_value, previous_value)
+                    return item
+            
+            debug_logger.debug("No match found for value: %s", previous_value)
+        
+        # If no match found, return None (don't create invalid combinations)
+        debug_logger.debug("No valid join found for node %s", node.node_type)
+        return None
+    
+    def _find_all_matching_items_for_combination(self, previous_item: Dict[str, Any], node_data: List[Dict[str, Any]], node: AttackPathNode, path_template: AttackPath) -> List[Dict[str, Any]]:
+        """Find ALL matching items from node_data that relate to previous_item based on join relationships"""
+        if not node.join or not previous_item:
+            # If no join or no previous item, return all items
+            return node_data
+        
+        matching_items = []
+        
+        # Find the join rule for this node
+        for join_def in node.join:
+            from_table = join_def["from"].split(".", 1)[0]
+            from_field = join_def["from"].split(".", 1)[1]
+            to_table = join_def["to"].split(".", 1)[0]
+            to_field = join_def["to"].split(".", 1)[1]
+            
+            # Get the value from previous_item using the field that should match
+            previous_value = previous_item.get(from_field)
+            if previous_value is None:
+                continue
+            
+            # Find ALL matching items in node_data where to_field matches previous_value
+            for item in node_data:
+                item_value = item.get(to_field)
+                if item_value == previous_value:
+                    matching_items.append(item)
+        
+        return matching_items
+    
+    def _build_all_combinations_from_first_node(self, first_item: Dict[str, Any], first_node: AttackPathNode, ordered_nodes: List[AttackPathNode], path_data: Dict[str, Any], path_template: AttackPath) -> List[Dict[str, Any]]:
+        """Build ALL possible combinations starting from the first node and following join relationships"""
+        combinations = []
+        
+        # Start with the first node
+        base_combination = {first_node.node_type: first_item}
+        
+        # Recursively build all combinations
+        self._build_combinations_recursive(base_combination, first_item, ordered_nodes[1:], path_data, path_template, combinations)
+        
+        return combinations
+    
+    def _build_cve_exploit_combinations(self, first_item: Dict[str, Any], first_node: AttackPathNode, ordered_nodes: List[AttackPathNode], path_data: Dict[str, Any], path_template: AttackPath) -> List[Dict[str, Any]]:
+        """Special logic for cve_exploit_internet_host: Group all CVEs per asset into one path"""
+        debug_logger.info("🚀 CVE EXPLOIT GROUPING: Building CVE exploit combinations with asset grouping")
+        debug_logger.info("🚀 Template ID: %s", path_template.id)
+        debug_logger.info("🚀 First item: %s", "None (processing entire dataset)" if first_item is None else "Single item")
+        
+        combinations = []
+        
+        # For cve_exploit_internet_host, the flow is: dns_to_ip -> ip_asset -> vulnerability_on_asset
+        # We want to group all CVEs for each unique asset into one path
+        
+        # Get the data for each node
+        dns_data = path_data.get('dns_to_ip', [])
+        ip_data = path_data.get('ip_asset', [])
+        cve_data = path_data.get('vulnerability_on_asset', [])
+        
+        debug_logger.debug("CVE exploit data: DNS=%d, IP=%d, CVE=%d", len(dns_data), len(ip_data), len(cve_data))
+        
+        # Group CVEs by asset (IP)
+        cves_by_asset = {}
+        for cve in cve_data:
+            asset = cve.get('asset')
+            if asset:
+                if asset not in cves_by_asset:
+                    cves_by_asset[asset] = []
+                cves_by_asset[asset].append(cve)
+        
+        debug_logger.debug("Grouped CVEs by asset: %d unique assets", len(cves_by_asset))
+        
+        # For each unique asset, create one path with all its CVEs
+        for asset, asset_cves in cves_by_asset.items():
+            debug_logger.info("Processing asset: %s with %d CVEs", asset, len(asset_cves))
+            
+            # Find the corresponding IP asset record
+            matching_ip = None
+            for ip_record in ip_data:
+                if ip_record.get('ip_range') == asset:
+                    matching_ip = ip_record
+                    break
+            
+            if not matching_ip:
+                debug_logger.warning("No matching IP record found for asset: %s", asset)
+                continue
+            
+            # Find the corresponding DNS record
+            matching_dns = None
+            for dns_record in dns_data:
+                if dns_record.get('value') == asset:
+                    matching_dns = dns_record
+                    break
+            
+            if not matching_dns:
+                debug_logger.warning("No matching DNS record found for asset: %s", asset)
+                continue
+            
+            # Create one combination with all CVEs for this asset
+            combination = {
+                'dns_to_ip': matching_dns,
+                'ip_asset': matching_ip,
+                'vulnerability_on_asset': asset_cves  # Array of all CVEs for this asset
+            }
+            
+            combinations.append(combination)
+            debug_logger.info("✅ Created combination for asset %s with %d CVEs", asset, len(asset_cves))
+        
+        debug_logger.info("CVE exploit combinations: %d unique assets with grouped CVEs", len(combinations))
+        return combinations
+    
+    def _build_combinations_recursive(self, current_combination: Dict[str, Any], current_item: Dict[str, Any], remaining_nodes: List[AttackPathNode], path_data: Dict[str, Any], path_template: AttackPath, combinations: List[Dict[str, Any]]):
+        """Recursively build all possible combinations"""
+        if not remaining_nodes:
+            # No more nodes to process, add this combination
+            combinations.append(current_combination.copy())
+            return
+        
+        current_node = remaining_nodes[0]
+        current_node_data = path_data.get(current_node.node_type, [])
+        
+        if not current_node_data:
+            # If no data for this node, continue with remaining nodes
+            self._build_combinations_recursive(current_combination, current_item, remaining_nodes[1:], path_data, path_template, combinations)
+            return
+        
+        # Find ALL matching items for the current node
+        matching_items = self._find_all_matching_items_for_combination(
+            current_item, current_node_data, current_node, path_template
+        )
+        
+        if not matching_items:
+            # If no matches found, this combination path is invalid
+            return
+        
+        # For each matching item, create a new combination and continue recursively
+        for matching_item in matching_items:
+            new_combination = current_combination.copy()
+            new_combination[current_node.node_type] = matching_item
+            
+            # Continue with remaining nodes
+            self._build_combinations_recursive(new_combination, matching_item, remaining_nodes[1:], path_data, path_template, combinations)
+    
+    async def _query_node_dynamic(self, node: AttackPathNode, organization_id: str, scan_id: str, where_conditions: Dict[str, List[Any]], db_type: str) -> List[Dict[str, Any]]:
+        """Query a node with dynamic WHERE conditions based on database type"""
+        debug_logger.debug("Querying node %s with database type %s", node.node_type, db_type)
+        
+        if db_type == "postgresql":
+            return await self._query_postgres_dynamic(node, organization_id, scan_id, where_conditions)
+        elif db_type == "dynamodb":
+            return await self._query_dynamodb_dynamic(node, organization_id, scan_id, where_conditions)
+        else:
+            logger.warning(f"Unknown database type '{db_type}' for table {node.table}")
+            return []
+    
+    async def _query_postgres_dynamic(self, node: AttackPathNode, organization_id: str, scan_id: str, where_conditions: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+        """Query PostgreSQL table with dynamic WHERE conditions"""
+        debug_logger.debug("Querying PostgreSQL table %s", node.table)
+        
+        # Use the database manager's dynamic query function with specific columns
+        return await self.db_manager.get_data_dynamic_postgres(
+            node.table, organization_id, scan_id, where_conditions, node.columns
+        )
+    
+    async def _query_dynamodb_dynamic(self, node: AttackPathNode, organization_id: str, scan_id: str, where_conditions: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+        """Query DynamoDB table with dynamic WHERE conditions"""
+        debug_logger.debug("Querying DynamoDB table %s", node.table)
+        
+        # Use the database manager's dynamic query function with specific columns
+        return await self.db_manager.get_data_dynamic_dynamodb(
+            node.table, organization_id, scan_id, where_conditions, node.columns
+        )
     
     async def _gather_path_data(self, path_template: AttackPath, organization_id: str, scan_id: str, cache: Dict[str, Any] = None) -> Dict[str, Any]:
         """Gather all data needed for a specific attack path and apply joins"""
@@ -542,7 +998,7 @@ class AttackPathEngine:
         
         # Apply additional selectors if present
         if node.selector:
-            findings = self._apply_findings_selectors(findings, node.selector)
+            findings = self._apply_selectors_dynamic(findings, node.selector)
         
         return findings
     
@@ -557,7 +1013,7 @@ class AttackPathEngine:
         
         # Apply selectors if present
         if node.selector:
-            cves = self._apply_cve_selectors(cves, node.selector)
+            cves = self._apply_selectors_dynamic(cves, node.selector)
         
         return cves
     
@@ -640,35 +1096,61 @@ class AttackPathEngine:
         # For now, return None as it requires additional logic
         return None
     
-    def _apply_findings_selectors(self, findings: List[Dict[str, Any]], selector: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Apply selectors to findings data"""
-        debug_logger.debug("Applying findings selectors: %r", selector)
+    def _apply_selectors_dynamic(self, data: List[Dict[str, Any]], selector: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generic selector that works with any field/operator combination"""
+        debug_logger.debug("Applying dynamic selectors: %r", selector)
         
-        # Log raw findings
-        for finding in findings[:5]:  # Show first 5
-            debug_logger.debug("[Findings RAW] %r", finding)
+        if not data or not selector:
+            return data
         
-        filtered_findings = findings
+        # Log raw data
+        for item in data[:3]:  # Show first 3
+            debug_logger.debug("[RAW DATA] %r", item)
+        
+        filtered_data = data
         
         for field, condition in selector.items():
             debug_logger.debug("Selector for field '%s': %r", field, condition)
             
-            if field == 'rule_id':
-                if condition.get('op') == 'in':
-                    rule_ids = condition.get('value', [])
-                    debug_logger.debug("Filtering rule_id IN: %r", rule_ids)
-                    filtered_findings = [f for f in filtered_findings if f.get('rule_id') in rule_ids]
-                elif condition.get('op') == '=':
-                    target_rule = condition.get('value', '')
-                    debug_logger.debug("Filtering rule_id EQUALS: %r", target_rule)
-                    filtered_findings = [f for f in filtered_findings if f.get('rule_id') == target_rule]
+            op = condition.get('op')
+            value = condition.get('value')
+            
+            if op == 'in':
+                if isinstance(value, list):
+                    filtered_data = [item for item in filtered_data if item.get(field) in value]
+                    debug_logger.debug("Filtering %s IN: %r", field, value)
+                else:
+                    debug_logger.warning("IN operator requires list value, got: %r", value)
+            elif op == '=':
+                filtered_data = [item for item in filtered_data if item.get(field) == value]
+                debug_logger.debug("Filtering %s EQUALS: %r", field, value)
+            elif op == 'not in':
+                if isinstance(value, list):
+                    filtered_data = [item for item in filtered_data if item.get(field) not in value]
+                    debug_logger.debug("Filtering %s NOT IN: %r", field, value)
+                else:
+                    debug_logger.warning("NOT IN operator requires list value, got: %r", value)
+            elif op == '>':
+                filtered_data = [item for item in filtered_data if item.get(field) > value]
+                debug_logger.debug("Filtering %s > %r", field, value)
+            elif op == '<':
+                filtered_data = [item for item in filtered_data if item.get(field) < value]
+                debug_logger.debug("Filtering %s < %r", field, value)
+            elif op == '>=':
+                filtered_data = [item for item in filtered_data if item.get(field) >= value]
+                debug_logger.debug("Filtering %s >= %r", field, value)
+            elif op == '<=':
+                filtered_data = [item for item in filtered_data if item.get(field) <= value]
+                debug_logger.debug("Filtering %s <= %r", field, value)
+            else:
+                debug_logger.warning("Unknown operator '%s' for field '%s'", op, field)
         
-        # Log filtered findings
-        for finding in filtered_findings[:5]:  # Show first 5
-            debug_logger.debug("[Findings AFTER SELECTOR] %r", finding)
+        # Log filtered data
+        for item in filtered_data[:3]:  # Show first 3
+            debug_logger.debug("[FILTERED DATA] %r", item)
         
-        debug_logger.info("Findings filtering: %d -> %d records", len(findings), len(filtered_findings))
-        return filtered_findings
+        debug_logger.info("Dynamic filtering: %d -> %d records", len(data), len(filtered_data))
+        return filtered_data
     
     def _apply_cve_selectors(self, cves: List[Dict[str, Any]], selector: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Apply selectors to CVE data"""
@@ -705,8 +1187,13 @@ class AttackPathEngine:
         # Handle new joined data structure
         raw_data = path_data.get("raw_data", path_data)
         for node in path_template.nodes:
-            if not node.optional and node.node_type not in raw_data:
-                return False
+            if not node.optional:
+                # Required node must be present AND non-empty
+                if node.node_type not in raw_data:
+                    return False
+                node_values = raw_data.get(node.node_type)
+                if not node_values:
+                    return False
         return True
     
     def _get_optional_nodes_present(self, path_template: AttackPath, path_data: Dict[str, Any]) -> List[str]:
@@ -721,24 +1208,48 @@ class AttackPathEngine:
     
     def _create_joined_data_structure(self, path_template: AttackPath, path_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create the new joined data structure with possible_paths"""
+        debug_logger.info("🔧 Creating joined data structure for template: %s", path_template.id)
+        
         # Handle both old and new data structures
         if "valid_combinations" in path_data:
-            # New structure with joins
+            # Old structure with joins
+            debug_logger.info("📊 Using OLD structure with valid_combinations")
             valid_combinations = path_data.get("valid_combinations", [])
             total_combinations = path_data.get("total_combinations", 0)
         else:
-            # Old structure without joins - create single combination
-            raw_data = path_data
+            # New dynamic structure - create combinations by following join relationships sequentially
+            debug_logger.info("🚀 Using NEW dynamic structure - creating combinations sequentially")
             valid_combinations = []
-            if raw_data:
-                # Create a single combination with all available data
-                combination = {}
-                for node in path_template.nodes:
-                    if node.node_type in raw_data and raw_data[node.node_type]:
-                        combination[node.node_type] = raw_data[node.node_type][0] if raw_data[node.node_type] else None
-                if combination:
-                    valid_combinations = [combination]
+            if path_data:
+                ordered_nodes = sorted(path_template.nodes, key=lambda n: n.order)
+                debug_logger.info("📋 Ordered nodes: %s", [n.node_type for n in ordered_nodes])
+                if ordered_nodes:
+                    # Start with the first node and build combinations sequentially
+                    first_node = ordered_nodes[0]
+                    first_node_data = path_data.get(first_node.node_type, [])
+                    debug_logger.info("🎯 First node: %s with %d items", first_node.node_type, len(first_node_data))
+                    
+                    # For cve_exploit_internet_host, use special grouping logic (call once, not per item)
+                    if path_template.id == "cve_exploit_internet_host":
+                        debug_logger.info("🎯 CVE EXPLOIT: Using special grouping logic (call once for entire dataset)")
+                        combinations = self._build_cve_exploit_combinations(
+                            None, first_node, ordered_nodes, path_data, path_template
+                        )
+                        for combination in combinations:
+                            combination["path_no"] = len(valid_combinations) + 1
+                            valid_combinations.append(combination)
+                    else:
+                        # For other templates, build combinations for each first item
+                        for first_item in first_node_data:
+                            combinations = self._build_all_combinations_from_first_node(
+                                first_item, first_node, ordered_nodes, path_data, path_template
+                            )
+                            for combination in combinations:
+                                combination["path_no"] = len(valid_combinations) + 1
+                                valid_combinations.append(combination)
+            
             total_combinations = len(valid_combinations)
+            debug_logger.info("📊 Total combinations created: %d", total_combinations)
         
         # Create the joined data structure
         joined_data = {
@@ -843,4 +1354,187 @@ class AttackPathEngine:
 
 
 # Global attack path engine instance
-attack_path_engine = AttackPathEngine() 
+attack_path_engine = AttackPathEngine()
+
+
+# AWS Batch Entry Point
+async def main():
+    """
+    AWS Batch entry point for attack path generation
+    """
+    import sys
+    import os
+    from datetime import datetime
+    from s3_utils import S3Manager
+    from llm_scoring_service import LLMScoringService
+    from database import DatabaseManager
+    from config import settings
+    
+    # Setup logging
+    logging.basicConfig(
+        level=getattr(logging, settings.LOG_LEVEL),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler()]
+    )
+    
+    # Set specific logger levels to reduce noise
+    logging.getLogger('boto3').setLevel(logging.WARNING)
+    logging.getLogger('botocore').setLevel(logging.WARNING)
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    
+    logger = logging.getLogger(__name__)
+    
+    try:
+        logger.info("🚀 Starting AWS Batch Attack Path Generation")
+        logger.info(f"   Domain: {settings.DOMAIN}")
+        logger.info(f"   Organization ID: {settings.ORGANIZATION_ID}")
+        logger.info(f"   Scan ID: {settings.SCAN_ID}")
+        logger.info(f"   AWS Region: {settings.AWS_REGION}")
+        
+        # Validate required environment variables
+        required_vars = ['DOMAIN', 'ORGANIZATION_ID', 'SCAN_ID']
+        missing_vars = [var for var in required_vars if not getattr(settings, var)]
+        if missing_vars:
+            logger.error(f"❌ Missing required environment variables: {missing_vars}")
+            sys.exit(1)
+        
+        # Step 1: Initialize S3 Manager
+        logger.info("📡 Initializing S3 Manager...")
+        s3_manager = S3Manager(settings.S3_BUCKET, settings.AWS_REGION)
+        
+        # Step 2: Download attack path templates from S3 (or use local fallback)
+        logger.info("📥 Loading attack path templates...")
+        try:
+            templates_data = s3_manager.download_attack_path_templates(settings.S3_TEMPLATES_KEY)
+            logger.info("✅ Templates loaded from S3")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load from S3: {e}")
+            logger.info("📁 Falling back to local templates file...")
+            
+            # Fallback to local file for testing
+            local_templates_file = "attack_paths_rules_enhanced.json"
+            try:
+                import json
+                with open(local_templates_file, 'r') as f:
+                    templates_data = json.load(f)
+                logger.info(f"✅ Templates loaded from local file: {local_templates_file}")
+            except Exception as local_e:
+                logger.error(f"❌ Failed to load local templates: {local_e}")
+                raise FileNotFoundError(f"Could not load templates from S3 or local file: {e}, {local_e}")
+        
+        # Step 3: Initialize database connections
+        logger.info("🗄️ Initializing database connections...")
+        db_manager = DatabaseManager()
+        await db_manager.initialize()
+        
+        # Step 4: Initialize attack path engine and load templates
+        logger.info("⚙️ Initializing attack path engine...")
+        engine = AttackPathEngine()
+        
+        # Load templates from S3 data (adapt format if needed)
+        await engine.load_attack_path_templates_from_data(templates_data)
+        logger.info(f"✅ Loaded {len(engine.path_templates)} attack path templates")
+        
+        # Step 5: Generate attack paths
+        logger.info("🔍 Generating attack paths...")
+        start_time = datetime.now()
+        
+        attack_paths_json = await engine.generate_attack_paths_json(
+            db_manager=db_manager,
+            organization_id=settings.ORGANIZATION_ID,
+            scan_id=settings.SCAN_ID
+        )
+        
+        generation_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"✅ Generated attack paths in {generation_time:.2f}s")
+        logger.info(f"   Templates processed: {len(attack_paths_json)}")
+        total_paths = sum(template.get('total_possible_paths', 0) for template in attack_paths_json)
+        logger.info(f"   Total attack paths: {total_paths}")
+        
+        # Step 6: Score attack paths with LLM
+        logger.info("🧠 Scoring attack paths with LLM...")
+        llm_service = LLMScoringService()
+        
+        scored_paths = await llm_service.score_attack_paths_from_json(
+            attack_paths_json=attack_paths_json,
+            chunk_size=settings.LLM_CHUNK_SIZE,
+            progress_callback=lambda current, total: logger.info(f"   Progress: {current}/{total} chunks processed")
+        )
+        
+        scoring_time = (datetime.now() - start_time).total_seconds() - generation_time
+        logger.info(f"✅ Completed LLM scoring in {scoring_time:.2f}s")
+        logger.info(f"   Scored paths: {len(scored_paths)}")
+        
+        # Step 7: Upload results to S3 (or save locally for testing)
+        logger.info("📤 Saving results...")
+        try:
+            s3_key = s3_manager.upload_attack_path_results(
+                domain=settings.DOMAIN,
+                organization_id=settings.ORGANIZATION_ID,
+                results_data=scored_paths
+            )
+            
+            # Step 8: Verify upload
+            if s3_manager.verify_upload(s3_key):
+                total_time = (datetime.now() - start_time).total_seconds()
+                logger.info("🎉 AWS Batch execution completed successfully!")
+                logger.info(f"   Total execution time: {total_time:.2f}s")
+                logger.info(f"   Results uploaded to: s3://{settings.S3_BUCKET}/{s3_key}")
+                sys.exit(0)
+            else:
+                logger.error("❌ Upload verification failed")
+                sys.exit(7)
+                
+        except Exception as e:
+            logger.warning(f"⚠️ S3 upload failed: {e}")
+            logger.info("📁 Saving results locally for testing...")
+            
+            # Fallback: save to local file
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            local_filename = f"local_batch_results_{settings.DOMAIN}_{timestamp}.json"
+            
+            try:
+                import json
+                with open(local_filename, 'w') as f:
+                    json.dump({
+                        "metadata": {
+                            "domain": settings.DOMAIN,
+                            "organization_id": settings.ORGANIZATION_ID,
+                            "generated_timestamp": timestamp,
+                            "generated_at": datetime.now().isoformat(),
+                            "local_execution": True
+                        },
+                        "results": scored_paths
+                    }, f, indent=2)
+                
+                total_time = (datetime.now() - start_time).total_seconds()
+                logger.info("🎉 Local batch execution completed successfully!")
+                logger.info(f"   Total execution time: {total_time:.2f}s")
+                logger.info(f"   Results saved locally: {local_filename}")
+                sys.exit(0)
+                
+            except Exception as local_e:
+                logger.error(f"❌ Failed to save results locally: {local_e}")
+                sys.exit(7)
+        
+    except FileNotFoundError as e:
+        logger.error(f"❌ Template file not found: {e}")
+        sys.exit(4)
+    except ConnectionError as e:
+        logger.error(f"❌ Database connection error: {e}")
+        sys.exit(2)
+    except Exception as e:
+        logger.error(f"❌ Unexpected error during batch execution: {e}")
+        logger.exception("Full error details:")
+        sys.exit(5)
+    finally:
+        # Cleanup database connections
+        if 'db_manager' in locals() and db_manager:
+            if db_manager.pg_pool:
+                await db_manager.pg_pool.close()
+                logger.info("🔌 PostgreSQL connection pool closed")
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main()) 

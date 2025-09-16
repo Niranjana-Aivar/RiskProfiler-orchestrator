@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timedelta
 
 from config import settings
+from database_config import is_postgresql_table, is_dynamodb_table
 # Removed Pydantic model imports - returning raw dictionaries instead
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,298 @@ class DatabaseManager:
             logger.error(f"Failed to initialize database connections: {e}")
             raise
     
+    async def get_data_dynamic_postgres(self, table: str, organization_id: str, scan_id: str, where_conditions: Dict[str, List[Any]] = None, columns: List[str] = None) -> List[Dict[str, Any]]:
+        """Dynamic PostgreSQL query with WHERE conditions"""
+        logger.debug(f"Dynamic PostgreSQL query for table {table}")
+        
+        if not self.pg_pool:
+            logger.error("PostgreSQL connection not available")
+            return []
+        
+        try:
+            # Special handling for Findings table
+            if table == "Findings":
+                # Build column selection for Findings
+                if columns:
+                    column_list = ', '.join([f'"{col}"' for col in columns])
+                    base_query = f'SELECT {column_list} FROM "{table}" WHERE scan_id = $1'
+                    logger.debug(f"Selecting specific columns for Findings: {columns}")
+                else:
+                    base_query = f'SELECT * FROM "{table}" WHERE scan_id = $1'
+                    logger.debug("Selecting all columns for Findings table")
+                
+                args = [scan_id]
+                param_count = 1
+                
+                # Add is_snoozed and is_whitelisted filters for Findings
+                param_count += 1
+                base_query += f' AND (is_snoozed IS NULL OR is_snoozed = ${param_count})'
+                args.append(False)
+                
+                param_count += 1
+                base_query += f' AND (is_whitelisted IS NULL OR is_whitelisted = ${param_count})'
+                args.append(False)
+                
+            else:
+                # Standard handling for other tables
+                if columns:
+                    column_list = ', '.join([f'"{col}"' for col in columns])
+                    base_query = f'SELECT {column_list} FROM "{table}" WHERE organization_id = $1'
+                    logger.debug(f"Selecting specific columns: {columns}")
+                else:
+                    base_query = f'SELECT * FROM "{table}" WHERE organization_id = $1'
+                    logger.debug("Selecting all columns (no specific columns provided)")
+                
+                args = [organization_id]
+                param_count = 1
+                
+                # Add scan_id condition if provided for non-Findings tables
+                if scan_id:
+                    param_count += 1
+                    base_query += f' AND scan_id = ${param_count}'
+                    args.append(scan_id)
+            
+            # Add WHERE conditions
+            if where_conditions:
+                for field, values in where_conditions.items():
+                    if values:  # Only add condition if we have values
+                        # Create placeholders starting from the next parameter number
+                        placeholders = ','.join([f'${param_count + i + 1}' for i in range(len(values))])
+                        base_query += f' AND "{field}" IN ({placeholders})'
+                        args.extend(values)
+                        param_count += len(values)
+            
+            logger.debug(f"Executing query: {base_query}")
+            logger.debug(f"Query args: {args}")
+            
+            async with self.pg_pool.acquire() as conn:
+                rows = await conn.fetch(base_query, *args)
+                
+                # Convert to list of dictionaries
+                results = []
+                for row in rows:
+                    result = dict(row)
+                    results.append(result)
+                
+                logger.info(f"Dynamic PostgreSQL query returned {len(results)} records for table {table}")
+                return results
+                    
+        except Exception as e:
+            logger.error(f"Error in dynamic PostgreSQL query for table {table}: {e}")
+            return []
+    
+    async def get_data_dynamic_dynamodb(self, table: str, organization_id: str, scan_id: str, where_conditions: Dict[str, List[Any]] = None, columns: List[str] = None) -> List[Dict[str, Any]]:
+        """Dynamic DynamoDB query with WHERE conditions"""
+        logger.debug(f"Dynamic DynamoDB query for table {table}")
+        
+        if not self.dynamo_session:
+            logger.error("DynamoDB connection not available")
+            return []
+        
+        # Check if we need to batch the WHERE conditions due to size limits
+        if where_conditions:
+            total_values = sum(len(values) for values in where_conditions.values())
+            if total_values > 100:  # DynamoDB limit is around 100-200 values in FilterExpression
+                logger.info(f"Batching DynamoDB query for table {table}: {total_values} values")
+                return await self._query_dynamodb_batched(table, organization_id, where_conditions, columns)
+        
+        try:
+            # Build DynamoDB query parameters
+            query_params = {
+                'TableName': table,
+                'KeyConditionExpression': 'organization_id = :org_id',
+                'ExpressionAttributeValues': {
+                    ':org_id': {'S': organization_id}
+                }
+            }
+            
+            # Query all fields (no ProjectionExpression to avoid reserved keyword issues)
+            
+            # Add WHERE conditions using FilterExpression
+            if where_conditions:
+                filter_expressions = []
+                for field, values in where_conditions.items():
+                    if values:
+                        # Create placeholder for each value
+                        value_placeholders = []
+                        for i, value in enumerate(values):
+                            placeholder = f':{field}_{i}'
+                            # Convert to DynamoDB format
+                            if isinstance(value, str):
+                                query_params['ExpressionAttributeValues'][placeholder] = {'S': value}
+                            elif isinstance(value, (int, float)):
+                                query_params['ExpressionAttributeValues'][placeholder] = {'N': str(value)}
+                            elif isinstance(value, bool):
+                                query_params['ExpressionAttributeValues'][placeholder] = {'BOOL': value}
+                            else:
+                                query_params['ExpressionAttributeValues'][placeholder] = {'S': str(value)}
+                            value_placeholders.append(placeholder)
+                        
+                        # Add IN condition
+                        filter_expressions.append(f'{field} IN ({",".join(value_placeholders)})')
+                
+                if filter_expressions:
+                    query_params['FilterExpression'] = ' AND '.join(filter_expressions)
+            
+            logger.debug(f"DynamoDB query params: {query_params}")
+            
+            # Execute query
+            async with self.dynamo_session.client('dynamodb') as client:
+                response = await client.query(**query_params)
+                raw_items = response.get('Items', [])
+            
+            # Parse DynamoDB items to regular dictionaries
+            results = []
+            for item in raw_items:
+                parsed_item = {}
+                for key, value in item.items():
+                    if 'S' in value:
+                        parsed_item[key] = value['S']
+                    elif 'N' in value:
+                        try:
+                            parsed_item[key] = float(value['N'])
+                        except ValueError:
+                            parsed_item[key] = value['N']
+                    elif 'BOOL' in value:
+                        parsed_item[key] = value['BOOL']
+                    elif 'L' in value:
+                        # Handle lists
+                        parsed_item[key] = [self._parse_dynamo_value(v) for v in value['L']]
+                    else:
+                        parsed_item[key] = value
+                results.append(parsed_item)
+            
+            # Filter columns if specified (since we query all fields)
+            if columns:
+                filtered_results = []
+                for item in results:
+                    filtered_item = {col: item.get(col) for col in columns if col in item}
+                    filtered_results.append(filtered_item)
+                logger.debug(f"Filtered DynamoDB results to columns: {columns}")
+                results = filtered_results
+            
+            logger.info(f"Dynamic DynamoDB query returned {len(results)} records for table {table}")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in dynamic DynamoDB query for table {table}: {e}")
+            return []
+
+    async def _query_dynamodb_batched(self, table: str, organization_id: str, where_conditions: Dict[str, List[Any]], columns: List[str] = None) -> List[Dict[str, Any]]:
+        """Batched DynamoDB query to handle large WHERE conditions"""
+        all_results = []
+        
+        # For each field with WHERE conditions, batch the values
+        for field, values in where_conditions.items():
+            if not values:
+                continue
+            
+            # Check if this field is a primary key (common primary key fields)
+            # Note: asset is NOT a primary key for OrganizationCVEsV2 (it's organization_id + date_cve)
+            is_primary_key = field in ['ip_range', 'name', 'value', 'domain', 'email']
+            
+            if is_primary_key:
+                # For primary keys, use BatchGetItem for efficient retrieval
+                logger.info(f"Using BatchGetItem for {len(values)} primary key values")
+                
+                # Split into batches of 100 (DynamoDB BatchGetItem limit)
+                batch_get_size = 100
+                for i in range(0, len(values), batch_get_size):
+                    batch_values = values[i:i + batch_get_size]
+                    
+                    # Prepare keys for BatchGetItem
+                    keys = []
+                    for value in batch_values:
+                        key = {
+                            'organization_id': {'S': organization_id},
+                            field: {'S': str(value)} if isinstance(value, str) else {'N': str(value)}
+                        }
+                        keys.append(key)
+                    
+                    # Prepare request items (no ProjectionExpression to avoid reserved keyword issues)
+                    request_item = {'Keys': keys}
+                    
+                    request_items = {table: request_item}
+                    
+                    async with self.dynamo_session.client('dynamodb') as client:
+                        response = await client.batch_get_item(RequestItems=request_items)
+                        raw_items = response.get('Responses', {}).get(table, [])
+                        batch_results = self._parse_dynamodb_items(raw_items)
+                        all_results.extend(batch_results)
+                    
+                    logger.info(f"BatchGetItem returned {len(batch_results)} records for batch {i//batch_get_size + 1}")
+            else:
+                # For non-primary keys, use FilterExpression with IN
+                # Split values into batches of 50 (safe size for DynamoDB)
+                batch_size = 50
+                for i in range(0, len(values), batch_size):
+                    batch_values = values[i:i + batch_size]
+                    
+                    query_params = {
+                        'TableName': table,
+                        'KeyConditionExpression': 'organization_id = :org_id',
+                        'FilterExpression': f'{field} IN ({",".join([f":{field}_{j}" for j in range(len(batch_values))])})',
+                        'ExpressionAttributeValues': {
+                            ':org_id': {'S': organization_id}
+                        }
+                    }
+                    
+                    # Add batch values to expression
+                    for j, value in enumerate(batch_values):
+                        if isinstance(value, str):
+                            query_params['ExpressionAttributeValues'][f':{field}_{j}'] = {'S': value}
+                        elif isinstance(value, (int, float)):
+                            query_params['ExpressionAttributeValues'][f':{field}_{j}'] = {'N': str(value)}
+                        elif isinstance(value, bool):
+                            query_params['ExpressionAttributeValues'][f':{field}_{j}'] = {'BOOL': value}
+                        else:
+                            query_params['ExpressionAttributeValues'][f':{field}_{j}'] = {'S': str(value)}
+                    
+                    async with self.dynamo_session.client('dynamodb') as client:
+                        response = await client.query(**query_params)
+                        raw_items = response.get('Items', [])
+                        batch_results = self._parse_dynamodb_items(raw_items)
+                        all_results.extend(batch_results)
+        
+        # Remove duplicates (same record might match multiple batches)
+        seen = set()
+        unique_results = []
+        for result in all_results:
+            # Create a unique key for each record (handle nested dicts)
+            key_items = []
+            for k, v in sorted(result.items()):
+                if isinstance(v, dict):
+                    # Convert dict to string for hashing
+                    key_items.append((k, str(sorted(v.items()))))
+                else:
+                    key_items.append((k, v))
+            key = tuple(key_items)
+            if key not in seen:
+                seen.add(key)
+                unique_results.append(result)
+        
+        # Filter columns if specified (since we query all fields)
+        if columns:
+            filtered_results = []
+            for item in unique_results:
+                filtered_item = {col: item.get(col) for col in columns if col in item}
+                filtered_results.append(filtered_item)
+            logger.debug(f"Filtered batched DynamoDB results to columns: {columns}")
+            unique_results = filtered_results
+        
+        logger.info(f"Batched DynamoDB query returned {len(unique_results)} unique records for table {table}")
+        return unique_results
+    
+    def _parse_dynamodb_items(self, raw_items: List[Dict]) -> List[Dict[str, Any]]:
+        """Parse DynamoDB items to regular dictionaries"""
+        results = []
+        for item in raw_items:
+            parsed_item = {}
+            for key, value in item.items():
+                parsed_item[key] = self._parse_dynamo_value(value)
+            results.append(parsed_item)
+        return results
+
     async def close(self):
         """Close database connections"""
         if self.pg_pool:
@@ -451,7 +744,7 @@ class DatabaseManager:
                         logger.warning(f"Error parsing email breach item: {e}")
                         continue
                 
-                logger.info(f"Email breaches for org {organization_id}: {len(email_breaches)} active records processed")
+                # logger.info(f"Email breaches for org {organization_id}: {len(email_breaches)} active records processed")
                 return email_breaches
                 
         except Exception as e:
@@ -729,6 +1022,20 @@ class DatabaseManager:
         except Exception:
             return None
     
+    def _parse_dynamo_value(self, value) -> Any:
+        """Parse a single DynamoDB value to Python type"""
+        if 'S' in value:
+            return value['S']
+        elif 'N' in value:
+            try:
+                return float(value['N'])
+            except ValueError:
+                return value['N']
+        elif 'BOOL' in value:
+            return value['BOOL']
+        else:
+            return value
+    
     async def get_typosquatting_domains(self, organization_id: str) -> List[Dict[str, Any]]:
         """Get typosquatting domains for organization from PostgreSQL - matches agent pattern"""
         if self.pg_pool is None:
@@ -853,7 +1160,7 @@ class DatabaseManager:
                         logger.warning(f"Error parsing logo abuse finding row: {e}")
                         continue
                 
-                logger.info(f"Retrieved {len(logo_abuse_findings)} logo abuse findings for organization {organization_id}")
+                # logger.info(f"Retrieved {len(logo_abuse_findings)} logo abuse findings for organization {organization_id}")
                 return logo_abuse_findings
                 
         except Exception as e:
@@ -915,7 +1222,7 @@ class DatabaseManager:
                         logger.warning(f"Error parsing portfolio domain row: {e}")
                         continue
                 
-                logger.info(f"Retrieved {len(portfolio_domains)} portfolio domains for organization {organization_id}")
+                # logger.info(f"Retrieved {len(portfolio_domains)} portfolio domains for organization {organization_id}")
                 return portfolio_domains
                 
         except Exception as e:

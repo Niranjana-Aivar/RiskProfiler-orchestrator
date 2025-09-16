@@ -2,11 +2,14 @@ import json
 import logging
 import asyncio
 import random
+import time
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime
+from dataclasses import dataclass, field
+from enum import Enum
 
 from models import (
     AttackPathInstance, LLMScoringInput, LLMScoringOutput, 
@@ -17,40 +20,326 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 
-async def call_bedrock_with_retries(call_fn, *args, max_attempts=5, base_delay=1.0, max_delay=30.0, **kwargs):
-    """Exponential backoff with jitter for Bedrock API calls"""
-    for attempt in range(max_attempts):
-        try:
-            return await call_fn(*args, **kwargs)
-        except ClientError as e:
-            # Check for ThrottlingException
-            if e.response.get("Error", {}).get("Code") == "ThrottlingException":
-                if attempt < max_attempts - 1:  # Don't sleep on the last attempt
-                    # Exponential backoff with jitter
-                    sleep = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
-                    logger.warning(f"Bedrock throttled, retrying in {sleep:.1f}s (attempt {attempt + 1}/{max_attempts})")
-                    await asyncio.sleep(sleep)
+# ============================================================================
+# PRODUCTION-GRADE BEDROCK THROTTLING AND RESILIENCE PATTERNS
+# ============================================================================
+
+class CircuitBreakerState(Enum):
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"          # Failing, reject requests
+    HALF_OPEN = "half_open"  # Testing if service recovered
+
+
+@dataclass
+class ThrottlingMetrics:
+    """Track throttling metrics for monitoring"""
+    total_requests: int = 0
+    throttled_requests: int = 0
+    successful_requests: int = 0
+    failed_requests: int = 0
+    circuit_breaker_trips: int = 0
+    total_retry_time: float = 0.0
+    max_retry_time: float = 0.0
+    last_throttle_time: Optional[float] = None
+    
+    @property
+    def throttle_rate(self) -> float:
+        """Calculate current throttling rate"""
+        return (self.throttled_requests / max(1, self.total_requests)) * 100
+    
+    @property
+    def success_rate(self) -> float:
+        """Calculate success rate"""
+        return (self.successful_requests / max(1, self.total_requests)) * 100
+
+
+@dataclass 
+class BedrockCircuitBreaker:
+    """Circuit breaker pattern for Bedrock API resilience"""
+    failure_threshold: int = 5  # Failures before opening
+    recovery_timeout: float = 60.0  # Seconds to wait before trying half-open
+    success_threshold: int = 3  # Successes needed to close from half-open
+    
+    # State tracking
+    state: CircuitBreakerState = field(default=CircuitBreakerState.CLOSED)
+    failure_count: int = field(default=0)
+    success_count: int = field(default=0)
+    last_failure_time: Optional[float] = field(default=None)
+    
+    def can_execute(self) -> bool:
+        """Check if request can be executed"""
+        now = time.time()
+        
+        if self.state == CircuitBreakerState.CLOSED:
+            return True
+        elif self.state == CircuitBreakerState.OPEN:
+            if now - (self.last_failure_time or 0) >= self.recovery_timeout:
+                self.state = CircuitBreakerState.HALF_OPEN
+                self.success_count = 0
+                logger.info("Circuit breaker transitioning to HALF_OPEN")
+                return True
+            return False
+        elif self.state == CircuitBreakerState.HALF_OPEN:
+            return True
+        
+        return False
+    
+    def record_success(self):
+        """Record successful request"""
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.success_count += 1
+            if self.success_count >= self.success_threshold:
+                self.state = CircuitBreakerState.CLOSED
+                self.failure_count = 0
+                logger.info("Circuit breaker CLOSED - service recovered")
+        elif self.state == CircuitBreakerState.CLOSED:
+            self.failure_count = max(0, self.failure_count - 1)  # Decay failures
+    
+    def record_failure(self):
+        """Record failed request"""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        
+        if self.state == CircuitBreakerState.CLOSED:
+            if self.failure_count >= self.failure_threshold:
+                self.state = CircuitBreakerState.OPEN
+                logger.warning(f"Circuit breaker OPEN after {self.failure_count} failures")
+        elif self.state == CircuitBreakerState.HALF_OPEN:
+            self.state = CircuitBreakerState.OPEN
+            logger.warning("Circuit breaker back to OPEN - recovery failed")
+
+
+class ProductionBedrockThrottling:
+    """Production-grade Bedrock throttling with all resilience patterns"""
+    
+    def __init__(self, 
+                 max_retries: int = 8,
+                 base_delay: float = 1.0,
+                 max_delay: float = 120.0,
+                 jitter_factor: float = 0.1,
+                 concurrent_limit: int = 2,
+                 adaptive_rate_limit: bool = True):
+        
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.jitter_factor = jitter_factor
+        self.concurrent_limit = concurrent_limit
+        self.adaptive_rate_limit = adaptive_rate_limit
+        
+        # Concurrency control
+        self.semaphore = asyncio.Semaphore(concurrent_limit)
+        
+        # Circuit breaker
+        self.circuit_breaker = BedrockCircuitBreaker()
+        
+        # Metrics
+        self.metrics = ThrottlingMetrics()
+        
+        # Adaptive rate limiting
+        self.current_delay = 0.0
+        self.last_success_time = time.time()
+        
+        # Dead letter queue for permanently failed requests
+        self.dead_letter_queue: List[Dict[str, Any]] = []
+    
+    async def execute_with_resilience(self, 
+                                    operation: Callable,
+                                    *args,
+                                    operation_id: str = "unknown",
+                                    **kwargs) -> Any:
+        """
+        Execute operation with full production resilience patterns:
+        - Circuit breaker
+        - Exponential backoff with jitter  
+        - Adaptive rate limiting
+        - Comprehensive metrics
+        - Dead letter queue
+        """
+        
+        # Check circuit breaker
+        if not self.circuit_breaker.can_execute():
+            self.metrics.circuit_breaker_trips += 1
+            raise Exception(f"Circuit breaker OPEN - rejecting {operation_id}")
+        
+        # Concurrency limiting
+        async with self.semaphore:
+            return await self._execute_with_retries(operation, *args, operation_id=operation_id, **kwargs)
+    
+    async def _execute_with_retries(self, operation: Callable, *args, operation_id: str, **kwargs) -> Any:
+        """Execute with exponential backoff and adaptive rate limiting"""
+        
+        self.metrics.total_requests += 1
+        start_time = time.time()
+        
+        # Apply adaptive rate limiting
+        if self.adaptive_rate_limit and self.current_delay > 0:
+            await asyncio.sleep(self.current_delay)
+        
+        last_exception = None
+        
+        for attempt in range(self.max_retries + 1):
+            try:
+                # Execute the operation
+                result = await operation(*args, **kwargs)
+                
+                # Record success
+                self.metrics.successful_requests += 1
+                self.circuit_breaker.record_success()
+                self._adapt_rate_limit(success=True)
+                
+                return result
+                
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "Unknown")
+                last_exception = e
+                
+                # Handle different error types
+                if error_code == "ThrottlingException":
+                    self.metrics.throttled_requests += 1
+                    self.metrics.last_throttle_time = time.time()
+                    
+                    if attempt < self.max_retries:
+                        delay = self._calculate_backoff_delay(attempt, is_throttling=True)
+                        logger.warning(f"Bedrock throttling {operation_id} - attempt {attempt + 1}/{self.max_retries + 1}, waiting {delay:.2f}s")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Max throttling retries exceeded for {operation_id}")
+                        self._adapt_rate_limit(success=False, is_throttling=True)
+                        
+                elif error_code in ["ValidationException", "AccessDeniedException"]:
+                    # Don't retry these - they're permanent failures
+                    logger.error(f"Permanent error for {operation_id}: {error_code}")
+                    break
+                    
+                elif error_code in ["InternalServerError", "ServiceUnavailableException"]:
+                    # Retry these with backoff
+                    if attempt < self.max_retries:
+                        delay = self._calculate_backoff_delay(attempt, is_throttling=False)
+                        logger.warning(f"Bedrock service error {operation_id} - attempt {attempt + 1}/{self.max_retries + 1}, waiting {delay:.2f}s")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Max service error retries exceeded for {operation_id}")
+                        
                 else:
-                    logger.error(f"Bedrock throttling retries exhausted after {max_attempts} attempts")
-                    raise
+                    # Unknown error - don't retry
+                    logger.error(f"Unknown Bedrock error for {operation_id}: {error_code}")
+                    break
+                    
+            except Exception as e:
+                # Non-Bedrock exceptions
+                last_exception = e
+                logger.error(f"Non-Bedrock error for {operation_id}: {e}")
+                break
+        
+        # All retries failed
+        self.metrics.failed_requests += 1
+        self.circuit_breaker.record_failure()
+        self._adapt_rate_limit(success=False)
+        
+        # Add to dead letter queue for analysis
+        self.dead_letter_queue.append({
+            "operation_id": operation_id,
+            "timestamp": time.time(),
+            "error": str(last_exception),
+            "attempts": self.max_retries + 1
+        })
+        
+        # Track retry time
+        retry_time = time.time() - start_time
+        self.metrics.total_retry_time += retry_time
+        self.metrics.max_retry_time = max(self.metrics.max_retry_time, retry_time)
+        
+        raise last_exception
+    
+    def _calculate_backoff_delay(self, attempt: int, is_throttling: bool = False) -> float:
+        """Calculate exponential backoff delay with jitter"""
+        
+        # More aggressive backoff for throttling
+        base = self.base_delay * (3 if is_throttling else 2)
+        
+        # Exponential backoff: base * (2^attempt)
+        delay = base * (2 ** attempt)
+        
+        # Cap at max delay
+        delay = min(delay, self.max_delay)
+        
+        # Add jitter to avoid thundering herd
+        jitter = delay * self.jitter_factor * random.random()
+        delay += jitter
+        
+        return delay
+    
+    def _adapt_rate_limit(self, success: bool, is_throttling: bool = False):
+        """Adaptive rate limiting based on success/failure patterns"""
+        if not self.adaptive_rate_limit:
+            return
+            
+        now = time.time()
+        
+        if success:
+            # Gradually reduce delay on success
+            self.current_delay *= 0.9
+            self.current_delay = max(0, self.current_delay)
+            self.last_success_time = now
+        else:
+            if is_throttling:
+                # Increase delay more aggressively for throttling
+                self.current_delay = min(self.max_delay, self.current_delay + 2.0)
             else:
-                # Other ClientError types: re-raise immediately
-                raise
-        except Exception as e:
-            # Non-ClientError exceptions: re-raise immediately
-            raise
-    raise Exception("Too many requests to Bedrock. Retries exhausted.")
+                # Moderate increase for other failures
+                self.current_delay = min(self.max_delay, self.current_delay + 0.5)
+    
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get comprehensive health status for monitoring"""
+        return {
+            "circuit_breaker_state": self.circuit_breaker.state.value,
+            "metrics": {
+                "total_requests": self.metrics.total_requests,
+                "success_rate": round(self.metrics.success_rate, 2),
+                "throttle_rate": round(self.metrics.throttle_rate, 2),
+                "circuit_breaker_trips": self.metrics.circuit_breaker_trips,
+                "avg_retry_time": round(self.metrics.total_retry_time / max(1, self.metrics.failed_requests), 2),
+                "max_retry_time": round(self.metrics.max_retry_time, 2)
+            },
+            "current_delay": round(self.current_delay, 2),
+            "dead_letter_queue_size": len(self.dead_letter_queue),
+            "last_throttle": self.metrics.last_throttle_time
+        }
+    
+    def reset_circuit_breaker(self):
+        """Manual circuit breaker reset for operations"""
+        self.circuit_breaker.state = CircuitBreakerState.CLOSED
+        self.circuit_breaker.failure_count = 0
+        self.circuit_breaker.success_count = 0
+        logger.info("Circuit breaker manually reset to CLOSED")
+    
+    def get_dead_letter_items(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent dead letter queue items for analysis"""
+        return self.dead_letter_queue[-limit:] if self.dead_letter_queue else []
+
+
+# Global production throttling instance
+production_throttling = ProductionBedrockThrottling()
+
+
+# ============================================================================
+# LLM SCORING SERVICE WITH INTEGRATED THROTTLING
+# ============================================================================
 
 
 class LLMScoringService:
     def __init__(self):
+        self.logger = logging.getLogger(__name__)
         self.bedrock_client = None
-        self.inference_profile_arn = settings.LLM_INFERENCE_PROFILE_ARN
+        # Use the inference profile ARN as the primary model ID
+        self.model_id = settings.LLM_INFERENCE_PROFILE_ARN
         self.temperature = settings.LLM_TEMPERATURE
         self.max_tokens = settings.LLM_MAX_TOKENS
         
-        # Concurrency limiting - configurable concurrent Bedrock calls
-        self.bedrock_semaphore = asyncio.Semaphore(settings.LLM_CONCURRENT_CALLS)
+        # Concurrency limiting is now handled by production_throttling
         
         # Boto3 configuration with increased timeouts
         self.boto3_config = Config(
@@ -202,15 +491,12 @@ Please provide your analysis in the exact JSON format above."""
         return "\n".join(formatted)
     
     async def _call_bedrock_api(self, prompt: str) -> str:
-        """Call the LLM API via Bedrock with concurrency limiting"""
-        async with self.bedrock_semaphore:
-            return await call_bedrock_with_retries(
-                self._make_bedrock_request, 
-                prompt,
-                max_attempts=settings.LLM_MAX_RETRY_ATTEMPTS,
-                base_delay=settings.LLM_BASE_RETRY_DELAY,
-                max_delay=settings.LLM_MAX_RETRY_DELAY
-            )
+        """Call the LLM API via Bedrock with production-grade throttling"""
+        return await production_throttling.execute_with_resilience(
+            self._make_bedrock_request,
+            prompt,
+            operation_id=f"bedrock_llm_{hash(prompt[:100]) % 10000}"
+        )
     
     async def _make_bedrock_request(self, prompt: str) -> str:
         """Make the actual Bedrock API request"""
@@ -218,7 +504,7 @@ Please provide your analysis in the exact JSON format above."""
             if not self.bedrock_client:
                 await self.initialize()
             
-            # Prepare the request payload for Claude
+            # Prepare the request payload for Claude-3.5 Sonnet
             request_body = {
                 "anthropic_version": "bedrock-2023-05-31",
                 "max_tokens": self.max_tokens,
@@ -234,28 +520,26 @@ Please provide your analysis in the exact JSON format above."""
             # Convert to JSON string
             request_body_json = json.dumps(request_body)
             
-            # Make the API call using inference profile ARN
+            # Make the API call using the configured model ID
             response = self.bedrock_client.invoke_model(
-                modelId=self.inference_profile_arn,
+                modelId=self.model_id,
                 body=request_body_json
             )
             
             # Parse the response
             response_body = json.loads(response['body'].read())
             
-            if 'content' in response_body:
-                # Extract the text content from Claude's response
-                content = response_body['content']
-                if isinstance(content, list) and len(content) > 0:
-                    return content[0].get('text', '')
-                elif isinstance(content, dict):
-                    return content.get('text', '')
+            # Claude-3.5 Sonnet response format
+            if 'content' in response_body and isinstance(response_body['content'], list):
+                for content_item in response_body['content']:
+                    if content_item.get('text'):
+                        return content_item['text']
             
             # Fallback response parsing
             return str(response_body)
                     
         except Exception as e:
-            logger.error(f"Error calling Bedrock API: {e}")
+            self.logger.error(f"Error calling Bedrock API with model {self.model_id}: {e}")
             raise
     
     def _parse_llm_response(self, response: str, path_instance: AttackPathInstance) -> LLMScoringOutput:
@@ -396,6 +680,309 @@ Please provide your analysis in the exact JSON format above."""
         risk_score = (settings.LIKELIHOOD_WEIGHT * likelihood_score + 
                      settings.IMPACT_WEIGHT * impact_score)
         return min(max(risk_score, 0.0), 1.0)  # Clamp to [0, 1]
+
+    async def score_attack_paths_from_json(
+        self, 
+        attack_paths_json: List[Dict[str, Any]], 
+        chunk_size: int = 10,
+        progress_callback: Optional[Callable[[int, int], None]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Score a list of attack paths represented as JSON using the LLM.
+
+        Args:
+            attack_paths_json: List of AttackPathInstance-like dicts.
+            chunk_size: Number of paths per LLM call.
+            progress_callback: Optional callback(progress_chunk, total_chunks).
+
+        Returns:
+            List of successfully scored attack paths (with .scoring fields).
+            Failed chunks are skipped, not replaced.
+        """
+        if not self.bedrock_client:
+            await self.initialize()
+            
+        scored_templates = []
+        
+        for template in attack_paths_json:
+            try:
+                scored_template = await self._score_template(template, chunk_size, progress_callback)
+                if scored_template:
+                    scored_templates.append(scored_template)
+            except Exception as e:
+                logger.error(f"Failed to score template {template.get('path_id', 'unknown')}: {e}")
+                continue
+        
+        return scored_templates
+
+    async def _score_template(
+        self, 
+        template: Dict[str, Any], 
+        chunk_size: int,
+        progress_callback: Optional[Callable[[int, int], None]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Score all possible paths in a single template"""
+        possible_paths = template.get('possible_paths', [])
+        if not possible_paths:
+            logger.warning(f"Template {template.get('path_id')} has no possible paths")
+            return template
+        
+        # Calculate total chunks for this template
+        total_chunks = max(1, (len(possible_paths) + chunk_size - 1) // chunk_size)
+        scored_paths = []
+        
+        logger.info(f"Scoring template {template.get('path_id')} with {len(possible_paths)} paths in {total_chunks} chunks")
+        
+        for idx in range(0, len(possible_paths), chunk_size):
+            chunk = possible_paths[idx: idx + chunk_size]
+            chunk_number = idx // chunk_size + 1
+            
+            try:
+                # Create a mini-template for this chunk
+                chunk_template = {
+                    **template,
+                    'possible_paths': chunk
+                }
+                
+                scored_chunk_paths = await self._score_chunk_with_retry(chunk_template, max_retries=3)
+                scored_paths.extend(scored_chunk_paths)
+                
+                logger.info(f"Successfully scored chunk {chunk_number}/{total_chunks} for template {template.get('path_id')}")
+                
+            except Exception as e:
+                logger.error(f"Chunk {chunk_number}/{total_chunks} failed permanently for template {template.get('path_id')}: {e}")
+                continue
+            
+            # Progress callback
+            if progress_callback:
+                progress_callback(chunk_number, total_chunks)
+        
+        # Create the final scored template
+        scored_template = {
+            **template,
+            'possible_paths': scored_paths,
+            'total_possible_paths': len(scored_paths)
+        }
+        
+        # Sort paths by risk_score descending
+        scored_template['possible_paths'] = sorted(
+            scored_template['possible_paths'],
+            key=lambda x: x.get("scoring", {}).get("risk_score", 0),
+            reverse=True
+        )
+        
+        return scored_template
+
+    async def _score_chunk_with_retry(self, chunk_template: Dict[str, Any], max_retries: int = 3, base_delay: float = 1.0) -> List[Dict[str, Any]]:
+        """
+        Score a chunk using production-grade throttling (max_retries and base_delay are ignored - handled by production_throttling)
+        """
+        prompt = self._create_batch_prompt(chunk_template)
+        response = await self._call_bedrock_api(prompt)
+        results = self._parse_llm_batch_response(response, chunk_template)
+        return results
+
+    def _create_batch_prompt(self, template: Dict[str, Any]) -> str:
+        """Create a batch prompt for scoring multiple paths in a template"""
+        possible_paths = template.get('possible_paths', [])
+        
+        prompt = f"""You are a cybersecurity risk assessment expert working for a legitimate organization's defensive security team. Your role is to analyze potential attack paths to help the organization improve their security posture and defend against threats.
+
+IMPORTANT DISCLAIMER: This analysis is for defensive cybersecurity purposes only - to help identify and mitigate vulnerabilities, not to enable attacks.
+
+Please analyze the following attack path template and score each possible path for defensive risk assessment purposes.
+
+**Attack Path Template:**
+- ID: {template.get('path_id')}
+- Name: {template.get('name')}
+- Description: {template.get('description')}
+- Goals: {', '.join(template.get('goals', []))}
+- Outcomes: {', '.join(template.get('outcomes', []))}
+- Nodes: {', '.join(template.get('nodes', []))}
+
+**Possible Paths to Score:** {len(possible_paths)} paths
+
+**Scoring Instructions:**
+For each path, analyze the node data and provide differentiated scores based on specific details:
+
+**SCORING DIFFERENTIATION FACTORS:**
+- CVE severity levels and CVSS base scores
+- Exploit availability and public exploit maturity
+- CISA KEV status (higher priority)
+- Attack vector complexity (NETWORK vs LOCAL vs ADJACENT)
+- Authentication requirements (NONE > SINGLE > MULTIPLE)
+- Asset exposure and internet accessibility
+- Service versions and known vulnerabilities
+- Asset activity patterns and last_seen timestamps
+- Port exposure and service configurations from additional_info
+
+1. **Likelihood Score (0.0-1.0):** How likely is this attack path to be exploited? Consider:
+   - Vulnerability severity and exploit availability
+   - CISA KEV status (prioritize paths with CISA KEV vulnerabilities)
+   - Attack vector (NETWORK preferred over LOCAL)
+   - Asset activity status and last_seen timestamps
+   - Number and criticality of vulnerabilities
+   - Service information from additional_info fields (ports, services, versions)
+   - Asset exposure level (internet-facing assets have higher likelihood)
+
+2. **Impact Score (0.0-1.0):** What would be the business impact if exploited? Consider:
+   - Asset criticality and business function
+   - Vulnerability severity (CRITICAL > HIGH > MEDIUM > LOW)
+   - Number of vulnerabilities on the same asset
+   - Asset role and importance in the infrastructure
+   - Data sensitivity and business disruption potential
+   - Service criticality from additional_info
+
+3. **Risk Score:** Calculate as: (likelihood_score * 0.6 + impact_score * 0.4) * 100
+   - **IMPORTANT**: Risk scores should be differentiated across paths to avoid ties
+   - Use precise float values (e.g., 67.45, 82.31, 91.76) not rounded numbers
+   - Range: 0.00 to 100.00 with 2 decimal places for clear ranking
+   - Consider subtle differences in vulnerability criticality, exploit complexity, and asset exposure
+   - Even similar paths should have slight score variations based on specific details
+
+4. **Attack Steps:** Generate 3-5 defensive mitigation steps that security teams should prioritize to prevent this attack path:
+   - Network monitoring and detection for reconnaissance activities
+   - Asset hardening and vulnerability patching priorities  
+   - Service configuration improvements and security controls
+   - Access controls and authentication strengthening
+   - Monitoring and alerting for suspicious activities
+
+5. **Confidence Level:** High/Medium/Low based on:
+   - Data quality and completeness
+   - Specificity of vulnerability information
+   - Asset information availability
+   - Service and version details in additional_info
+
+6. **Reasoning:** Explain your scoring with specific evidence references from:
+   - Vulnerability details (CVE IDs, severity, exploit availability)
+   - Asset information (IP, activity status, last_seen)
+   - Service details from additional_info fields
+   - CISA KEV status and public exploit availability
+
+**Response Format (JSON Array):**
+[
+  {{
+    "path_no": 1,
+    "scoring": {{
+      "likelihood_score": 0.8547,
+      "impact_score": 0.7312,
+      "risk_score": 80.37,
+      "alpha": 0.6,
+      "attack_steps": [
+        "Step 1: Implement DNS monitoring to detect reconnaissance...",
+        "Step 2: Deploy network segmentation and access controls...",
+        "Step 3: Patch CVE vulnerabilities and harden services..."
+      ],
+      "confidence_level": "High",
+      "reasoning": "Detailed explanation..."
+    }}
+  }},
+  {{
+    "path_no": 2,
+    "scoring": {{
+      "likelihood_score": 0.7821,
+      "impact_score": 0.6943,
+      "risk_score": 74.70,
+      "alpha": 0.6,
+      "attack_steps": [
+        "Step 1: Different defensive monitoring approach...",
+        "Step 2: Alternative security controls...",
+        "Step 3: Specific mitigation for this path..."
+      ],
+      "confidence_level": "Medium",
+      "reasoning": "Different reasoning for this path..."
+    }}
+  }}
+]
+
+**CRITICAL**: Ensure each path has a unique risk_score with 2 decimal places. No two paths should have identical scores.
+
+**REMINDER**: This analysis is for defensive security purposes to help protect the organization from these attack paths.
+
+**Paths Data:**
+"""
+        
+        # Add each path's data - renumber sequentially for this chunk
+        for i, path in enumerate(possible_paths, 1):
+            prompt += f"\n**Path {i} (path_no: {i}):**\n"
+            
+            # Add node data for each path
+            for node_name in template.get('nodes', []):
+                if node_name in path:
+                    node_data = path[node_name]
+                    prompt += f"- {node_name}: {json.dumps(node_data, indent=2)}\n"
+            
+            prompt += "\n"
+        
+        prompt += "\nPlease provide your analysis in the exact JSON format above, with one scoring object per path."
+        
+        return prompt
+
+    def _parse_llm_batch_response(self, response: str, template: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Parse the LLM batch response and merge with original path data"""
+        try:
+            # Extract JSON array from response
+            json_start = response.find('[')
+            json_end = response.rfind(']') + 1
+            
+            if json_start != -1 and json_end != -1:
+                json_str = response[json_start:json_end]
+                parsed_scores = json.loads(json_str)
+                
+                # Merge scoring data with original paths
+                possible_paths = template.get('possible_paths', [])
+                scored_paths = []
+                
+                for i, path in enumerate(possible_paths):
+                    scored_path = path.copy()
+                    
+                    # Match by sequential index (1, 2, 3...) since we renumbered in prompt
+                    sequential_path_no = i + 1
+                    matching_score = None
+                    
+                    for score in parsed_scores:
+                        if score.get('path_no') == sequential_path_no:
+                            matching_score = score.get('scoring', {})
+                            break
+                    
+                    if matching_score:
+                        scored_path['scoring'] = matching_score
+                    else:
+                        # Skip paths without LLM scores - no fallback
+                        logger.error(f"No LLM score found for sequential path {sequential_path_no}, skipping path")
+                        continue
+                    
+                    scored_paths.append(scored_path)
+                
+                return scored_paths
+            else:
+                # Fail if JSON extraction fails - no fallback
+                raise ValueError("Could not extract JSON array from LLM response")
+                
+        except Exception as e:
+            logger.error(f"Error parsing LLM batch response: {e}")
+            raise
+    
+    def get_throttling_health_status(self) -> Dict[str, Any]:
+        """Get comprehensive throttling and health metrics"""
+        health_status = production_throttling.get_health_status()
+        
+        # Add LLM-specific context
+        health_status['llm_model'] = self.model_id
+        health_status['temperature'] = self.temperature
+        health_status['max_tokens'] = self.max_tokens
+        
+        return health_status
+    
+    def reset_throttling_circuit_breaker(self):
+        """Reset circuit breaker for manual intervention"""
+        production_throttling.reset_circuit_breaker()
+        logger.info("LLM throttling circuit breaker manually reset")
+    
+    def get_failed_requests_analysis(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent failed requests for debugging"""
+        return production_throttling.get_dead_letter_items(limit)
+
 
 
 # Global LLM scoring service instance
